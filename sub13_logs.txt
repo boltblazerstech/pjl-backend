@@ -1,0 +1,5 @@
+﻿EXCEPTION | [TOTAL_MISMATCH] Invoice total mismatch: line-item subtotal(73794.96) + tax(25278.90) = 99073.86, but stated total is 165717.00 (diff Γé╣66643.14).
+EXCEPTION | [WARRANTY_MISSING] PO requires warranty ('Guarantee/Warranty: 12 Months from the date of Installation Or 18 Months from the date of Supply whichever is earlier for Mfg. Defects') but invoice contains no warranty information.
+VERIFIED | Verification complete. Status=RED, lineItems=2, exceptions=2
+LINE: ('X600-26876-2 Pump Element K6', Decimal('11655.2000'), Decimal('11655.2000'), None)
+LINE: ('H25-299060-9 HOSE SAE100R2,1/4"ID,D08,350 OMM LONG', Decimal('6471.5600'), Decimal('6471.5600'), None)

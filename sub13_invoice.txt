@@ -1,0 +1,25 @@
+﻿doc_type: invoice
+line_items: [
+  {
+    "uom": "PIECES",
+    "rate": 11655.2,
+    "amount": 34965.6,
+    "hsn_sac": "84799090",
+    "quantity": 3,
+    "description": "X600-26876-2 Pump Element K6",
+    "discount_percent": null
+  },
+  {
+    "uom": "PIECES",
+    "rate": 6471.56,
+    "amount": 38829.36,
+    "hsn_sac": "84799090",
+    "quantity": 6,
+    "description": "H25-299060-9 HOSE SAE100R2,1/4\"ID,D08,350 OMM LONG",
+    "discount_percent": null
+  }
+]
+cgst: 12639.45
+sgst: 12639.45
+total_amount: 165717.0
+amount_in_words: Rs. One Lakhs Sixty-Five Thousand Seven Hundred Seventeen
