@@ -21,10 +21,6 @@ public class Submission extends AuditableEntity {
     @JoinColumn(name = "bill_category_id", nullable = false)
     private BillCategory billCategory;
 
-    @ManyToOne
-    @JoinColumn(name = "group_id")
-    private DocumentGroup documentGroup;
-
     @Column(name = "status", nullable = false)
     private String status;
 

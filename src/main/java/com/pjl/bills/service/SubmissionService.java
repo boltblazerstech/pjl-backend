@@ -8,12 +8,10 @@ import com.pjl.bills.dto.SubmissionResponse;
 import com.pjl.bills.dto.SubmissionSummaryDto;
 import com.pjl.bills.entity.BillCategory;
 import com.pjl.bills.entity.Document;
-import com.pjl.bills.entity.DocumentGroup;
 import com.pjl.bills.entity.MatchedLineItemEntity;
 import com.pjl.bills.entity.Submission;
 import com.pjl.bills.event.SubmissionCreatedEvent;
 import com.pjl.bills.repository.BillCategoryRepository;
-import com.pjl.bills.repository.DocumentGroupRepository;
 import com.pjl.bills.repository.DocumentRepository;
 import com.pjl.bills.repository.MatchedLineItemRepository;
 import com.pjl.bills.repository.SubmissionRepository;
@@ -21,7 +19,6 @@ import com.pjl.core.entity.AuditLog;
 import com.pjl.core.repository.AuditLogRepository;
 import com.pjl.core.sink.OutputSink;
 import com.pjl.core.storage.FileStorage;
-import com.pjl.core.storage.PostgresFileStorage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
@@ -50,24 +47,18 @@ public class SubmissionService {
     private final DocumentRepository documentRepository;
     private final AuditLogRepository auditLogRepository;
     private final MatchedLineItemRepository matchedLineItemRepository;
-    private final FileStorage fileStorage;             // Primary — R2
-    private final PostgresFileStorage postgresFileStorage; // Explicit Postgres path for saveAsGroup=false
-    private final DocumentGroupRepository groupRepository;
+    private final FileStorage fileStorage;
     private final ApplicationEventPublisher eventPublisher;
     private final com.pjl.bills.VerificationStrategyRegistry strategyRegistry;
     private final OutputSink outputSink;
 
     /**
      * Creates a new submission for the given bill category using the uploaded files.
-     * <p>
-     * When {@code saveAsGroup} is {@code true} (the default), the files are first uploaded
-     * to R2 as a new {@link com.pjl.bills.entity.DocumentGroup} and the submission is linked
-     * to that group. When {@code false}, files are stored only in Postgres bytea for the
-     * duration of extraction and no group or R2 object is created.
+     * Files are unconditionally uploaded to R2 via FileStorage.
+     * Returns 202 Accepted immediately; extraction and verification proceed asynchronously.
      */
     @Transactional
     public SubmissionResponse createSubmission(Long billCategoryId,
-                                               boolean saveAsGroup,
                                                MultipartHttpServletRequest request) {
         BillCategory category = billCategoryRepository.findById(billCategoryId)
                 .orElseThrow(() -> new IllegalArgumentException("BillCategory not found for ID: " + billCategoryId));
@@ -78,18 +69,15 @@ public class SubmissionService {
         }
 
         List<String> missing = new ArrayList<>();
-        Map<String, List<MultipartFile>> uploadedFiles = new HashMap<>();
+        Map<String, MultipartFile> uploadedFiles = new HashMap<>();
 
-        // Validate that every required document type is provided as a part in the request
-        // getFiles() supports multiple files under the same form key (multi-page documents)
         for (String reqType : requiredDocs) {
             List<MultipartFile> files = request.getFiles(reqType);
-            // Filter out empty entries
             files = files.stream().filter(f -> !f.isEmpty()).toList();
             if (files.isEmpty()) {
                 missing.add(reqType);
             } else {
-                uploadedFiles.put(reqType, files);
+                uploadedFiles.put(reqType, files.getFirst());
             }
         }
 
@@ -103,113 +91,116 @@ public class SubmissionService {
         submission.setBillCategory(category);
         submission.setStatus("PENDING");
         submission.setUploadedAt(Instant.now());
+        submission = submissionRepository.save(submission);
 
-        if (saveAsGroup) {
-            // ── Path A: create a DocumentGroup and upload files to R2 ──
-            DocumentGroup group = createGroupFromFiles(category, null, uploadedFiles);
-            submission.setDocumentGroup(group);
-            submission = submissionRepository.save(submission);
-
-            // Create Document rows pointing at the R2 keys from the group
-            for (Map.Entry<String, List<MultipartFile>> entry : uploadedFiles.entrySet()) {
-                String docType = entry.getKey();
-                String r2Key = switch (docType) {
-                    case "invoice" -> group.getInvoiceFileRef();
-                    case "po"      -> group.getPoFileRef();
-                    case "grn"     -> group.getGrnFileRef();
-                    default        -> null;
-                };
+        // Upload each file to R2 and create a Document row
+        String prefix = "submissions/" + submission.getId() + "/";
+        for (Map.Entry<String, MultipartFile> entry : uploadedFiles.entrySet()) {
+            String docType = entry.getKey();
+            MultipartFile f = entry.getValue();
+            try {
+                String key = fileStorage.uploadRawFile(prefix, f.getOriginalFilename(),
+                        f.getContentType(), f.getBytes());
                 Document doc = new Document();
                 doc.setSubmission(submission);
                 doc.setDocType(docType);
-                doc.setFileRef(r2Key != null ? r2Key : docType);
+                doc.setFileRef(key);
                 documentRepository.save(doc);
-            }
-        } else {
-            // ── Path B: no R2, no group — store bytes in Postgres bytea only ──
-            submission = submissionRepository.save(submission);
-
-            for (Map.Entry<String, List<MultipartFile>> entry : uploadedFiles.entrySet()) {
-                String docType = entry.getKey();
-                List<MultipartFile> files = entry.getValue();
-
-                Document doc = new Document();
-                doc.setSubmission(submission);
-                doc.setDocType(docType);
-                doc.setFileRef("not-saved"); // clearly marks that no permanent file was stored
-
-                doc = documentRepository.save(doc);
-
-                try {
-                    if (files.size() == 1) {
-                        // Write directly to Postgres file_data — no R2
-                        postgresFileStorage.store(doc, files.getFirst().getBytes());
-                    } else {
-                        List<FileStorage.PageUpload> pages = new ArrayList<>();
-                        for (MultipartFile file : files) {
-                            pages.add(new FileStorage.PageUpload(
-                                    file.getOriginalFilename(),
-                                    file.getContentType(),
-                                    file.getBytes()
-                            ));
-                        }
-                        postgresFileStorage.storePages(doc, pages);
-                        log.info("Stored {} pages (Postgres, no-R2) for document type '{}' (doc id={})",
-                                pages.size(), docType, doc.getId());
-                    }
-                } catch (IOException e) {
-                    log.error("Failed to read bytes for document type: {}", docType, e);
-                    throw new IllegalArgumentException("Failed to read uploaded file for type: " + docType, e);
-                }
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Failed to read uploaded file for type: " + docType, e);
             }
         }
 
-        log.info("Created new submission ID {} (Category: {}, saveAsGroup={}) with status PENDING",
-                submission.getId(), category.getName(), saveAsGroup);
+        log.info("Created submission ID {} (Category: {}) with status PENDING — {} documents uploaded to R2",
+                submission.getId(), category.getName(), uploadedFiles.size());
 
-        // Publish post-commit: async orchestrator picks this up after the TX commits,
-        // so it always finds the submission + documents already in the DB.
         eventPublisher.publishEvent(new SubmissionCreatedEvent(this, submission.getId()));
 
         return new SubmissionResponse(submission.getId(), submission.getStatus());
     }
 
     /**
-     * Creates a DocumentGroup by uploading each file in {@code uploadedFiles} to R2.
-     * Only the first file per docType is used (groups are single-file-per-type).
+     * Replaces one or more files on an existing submission. At least one file must be provided.
+     * Each provided file is uploaded to R2 and the corresponding Document row's fileRef is updated.
+     * The old R2 object is intentionally left in place (orphaned) — cleanup is out of scope for now.
      */
-    private DocumentGroup createGroupFromFiles(BillCategory category, String name,
-                                               Map<String, List<MultipartFile>> uploadedFiles) {
-        DocumentGroup group = new DocumentGroup();
-        group.setBillCategory(category);
-        group.setName(name != null && !name.isBlank() ? name : "Pending");
-        group = groupRepository.save(group);
+    @Transactional
+    public SubmissionDetailDto replaceFiles(Long submissionId, MultipartHttpServletRequest request) {
+        Submission submission = submissionRepository.findById(submissionId)
+                .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + submissionId));
 
-        if (name == null || name.isBlank()) {
-            group.setName("Group-" + group.getId());
+        List<Document> docs = documentRepository.findBySubmission(submission);
+        Map<String, Document> docByType = new HashMap<>();
+        for (Document d : docs) {
+            docByType.put(d.getDocType(), d);
         }
 
-        String prefix = "groups/" + group.getId() + "/";
-        try {
-            for (Map.Entry<String, List<MultipartFile>> entry : uploadedFiles.entrySet()) {
-                MultipartFile f = entry.getValue().getFirst();
-                String key = fileStorage.uploadRawFile(prefix, f.getOriginalFilename(), f.getContentType(), f.getBytes());
-                switch (entry.getKey()) {
-                    case "invoice" -> group.setInvoiceFileRef(key);
-                    case "po"      -> group.setPoFileRef(key);
-                    case "grn"     -> group.setGrnFileRef(key);
+        String prefix = "submissions/" + submissionId + "/";
+        boolean anyReplaced = false;
+        for (String docType : List.of("invoice", "po", "grn")) {
+            MultipartFile f = request.getFile(docType);
+            if (f == null || f.isEmpty()) continue;
+            try {
+                String key = fileStorage.uploadRawFile(prefix, f.getOriginalFilename(),
+                        f.getContentType(), f.getBytes());
+                Document doc = docByType.get(docType);
+                if (doc != null) {
+                    doc.setFileRef(key);
+                    documentRepository.save(doc);
+                    log.info("Replaced {} file for submission {} → {}", docType, submissionId, key);
+                    anyReplaced = true;
+                } else {
+                    log.warn("No existing document of type '{}' found for submission {} — skipping replacement",
+                            docType, submissionId);
                 }
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Failed to read uploaded file for type: " + docType, e);
             }
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to read uploaded files for group creation", e);
         }
 
-        return groupRepository.save(group);
+        if (!anyReplaced) {
+            throw new IllegalArgumentException("At least one file (invoice, po, or grn) must be provided");
+        }
+
+        return getSubmissionDetail(submissionId);
+    }
+
+    /**
+     * Re-runs the full extraction → verification pipeline for an existing submission,
+     * using its CURRENT file refs (which may have just been updated via replaceFiles).
+     * <p>
+     * Before starting: clears matched line items, clears audit log entries, resets status to PENDING.
+     * Returns immediately — processing is asynchronous.
+     */
+    @Transactional
+    public SubmissionResponse rerunSubmission(Long submissionId) {
+        Submission submission = submissionRepository.findById(submissionId)
+                .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + submissionId));
+
+        // Clear matched line items
+        List<MatchedLineItemEntity> items = matchedLineItemRepository
+                .findBySubmissionIdOrderByIdAsc(submissionId);
+        matchedLineItemRepository.deleteAll(items);
+
+        // Clear all audit log entries for this submission
+        auditLogRepository.deleteByEntityTypeAndEntityId("Submission", submissionId);
+
+        // Reset status and warranty status
+        submission.setStatus("PENDING");
+        submission.setWarrantyStatus(null);
+        submissionRepository.save(submission);
+
+        log.info("Rerun initiated for submission {} — cleared {} line items and all audit logs",
+                submissionId, items.size());
+
+        // Publish event — VerificationOrchestrator picks it up asynchronously after TX commits
+        eventPublisher.publishEvent(new SubmissionCreatedEvent(this, submissionId));
+
+        return new SubmissionResponse(submission.getId(), "PENDING");
     }
 
     /**
      * Retrieves a paginated list of submissions, optionally filtered by status.
-     * Returns a lightweight summary view.
      */
     @Transactional(readOnly = true)
     public Page<SubmissionSummaryDto> getSubmissions(String status, Pageable pageable) {
@@ -219,7 +210,7 @@ public class SubmissionService {
         } else {
             page = submissionRepository.findAll(pageable);
         }
-        
+
         return page.map(s -> new SubmissionSummaryDto(
                 s.getId(),
                 s.getBillCategory().getName(),
@@ -230,7 +221,7 @@ public class SubmissionService {
 
     /**
      * Retrieves the full detail view for a single submission, including its
-     * parsed documents (but excluding raw file bytes) and chronologically sorted audit logs.
+     * parsed documents and chronologically sorted audit logs.
      */
     @Transactional(readOnly = true)
     public SubmissionDetailDto getSubmissionDetail(Long id) {
@@ -246,12 +237,10 @@ public class SubmissionService {
                 .map(a -> new AuditLogDto(a.getId(), a.getAction(), a.getDetail(), a.getActor(), a.getCreatedAt()))
                 .toList();
 
-        // Filter exceptions (audit entries with action = "EXCEPTION") into a dedicated list
         List<AuditLogDto> exceptions = logs.stream()
                 .filter(a -> "EXCEPTION".equals(a.action()))
                 .toList();
 
-        // Matched line items (empty for FAILED submissions that never reached the matching stage)
         List<MatchedLineItemDto> matchedLineItems = matchedLineItemRepository
                 .findBySubmissionIdOrderByIdAsc(id).stream()
                 .map(e -> new MatchedLineItemDto(
@@ -284,7 +273,6 @@ public class SubmissionService {
 
     /**
      * Manually overrides the status of a submission and records the action in the audit log.
-     * Requires a non-blank reason.
      */
     @Transactional
     public SubmissionDetailDto overrideSubmission(Long id, com.pjl.bills.dto.OverrideRequest request) {
@@ -306,30 +294,11 @@ public class SubmissionService {
         entry.setEntityId(s.getId());
         entry.setAction("OVERRIDDEN");
         entry.setDetail(String.format("Changed from %s to %s. Reason: %s", oldStatus, newStatus, request.reason()));
-        entry.setActor("system"); // This would be the authenticated user ID in a real system
+        entry.setActor("system");
         auditLogRepository.save(entry);
 
         log.info("Submission ID {} manually overridden from {} to {}", id, oldStatus, newStatus);
-        
+
         return getSubmissionDetail(id);
-    }
-
-    @Transactional
-    public void reVerifySubmission(Long id) {
-        Submission submission = submissionRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("Submission not found"));
-
-        List<Document> documents = documentRepository.findBySubmission(submission);
-        com.pjl.bills.VerificationStrategy strategy =
-            strategyRegistry.resolve(submission.getBillCategory().getVerificationStrategyKey());
-
-        com.pjl.core.sink.dto.VerifiedSubmissionResult result = strategy.verify(submission, documents);
-
-        // Clear stale matched line items before re-persisting
-        matchedLineItemRepository.deleteAll(
-                matchedLineItemRepository.findBySubmissionIdOrderByIdAsc(submission.getId()));
-
-        // Re-use the OutputSink to persist the result consistently
-        outputSink.saveVerifiedSubmission(result);
     }
 }

@@ -15,6 +15,8 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartHttpServletRequest;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.util.Map;
+
 @RestController
 @RequestMapping("/api/submissions")
 @RequiredArgsConstructor
@@ -23,23 +25,52 @@ public class SubmissionController {
     private final SubmissionService submissionService;
 
     /**
-     * Endpoint for submitting a new set of documents for bill verification.
-     * Expected as multipart/form-data with 'billCategoryId' and file parts matching 
-     * the category's required document types (e.g. 'invoice', 'po', 'grn').
-     * <p>
-     * Returns 202 Accepted immediately if validation passes.
+     * Creates a new submission. Files are uploaded to R2 unconditionally.
+     * Returns 202 Accepted immediately; async orchestration handles extraction/verification.
      */
     @PostMapping
     public ResponseEntity<SubmissionResponse> createSubmission(
             @RequestParam("billCategoryId") Long billCategoryId,
-            @RequestParam(value = "saveAsGroup", defaultValue = "true") boolean saveAsGroup,
             MultipartHttpServletRequest request) {
-        
         try {
-            SubmissionResponse response = submissionService.createSubmission(billCategoryId, saveAsGroup, request);
+            SubmissionResponse response = submissionService.createSubmission(billCategoryId, request);
             return ResponseEntity.accepted().body(response);
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+
+    /**
+     * Replaces one or more files on an existing submission.
+     * At least one file (invoice, po, grn) must be provided in the multipart body.
+     * The old R2 objects are orphaned (not deleted).
+     */
+    @PatchMapping("/{id}/files")
+    public ResponseEntity<SubmissionDetailDto> replaceFiles(
+            @PathVariable Long id,
+            MultipartHttpServletRequest request) {
+        try {
+            return ResponseEntity.ok(submissionService.replaceFiles(id, request));
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+
+    /**
+     * Re-runs the full extraction → verification pipeline for a submission,
+     * using its current file refs. Clears previous matched line items, exceptions,
+     * and audit log before starting. Returns 202 Accepted immediately.
+     */
+    @PostMapping("/{id}/rerun")
+    public ResponseEntity<Map<String, Object>> rerunSubmission(@PathVariable Long id) {
+        try {
+            SubmissionResponse resp = submissionService.rerunSubmission(id);
+            return ResponseEntity.accepted().body(Map.of(
+                    "submissionId", resp.id(),
+                    "message", "Rerun started for submission " + id
+            ));
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage());
         }
     }
 
@@ -54,8 +85,7 @@ public class SubmissionController {
     }
 
     /**
-     * Retrieves the full detail view for a single submission, including its
-     * parsed documents and chronologically sorted audit logs.
+     * Retrieves the full detail view for a single submission.
      */
     @GetMapping("/{id}")
     public ResponseEntity<SubmissionDetailDto> getSubmissionDetail(@PathVariable Long id) {
@@ -77,16 +107,6 @@ public class SubmissionController {
             return ResponseEntity.ok(submissionService.overrideSubmission(id, request));
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
-        }
-    }
-
-    @PostMapping("/{id}/reverify")
-    public ResponseEntity<Void> reVerifySubmission(@PathVariable Long id) {
-        try {
-            submissionService.reVerifySubmission(id);
-            return ResponseEntity.ok().build();
-        } catch (IllegalArgumentException e) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage());
         }
     }
 }
