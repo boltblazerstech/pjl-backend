@@ -57,6 +57,23 @@ public class SubmissionController {
     }
 
     /**
+     * Deletes a specific document's file from R2 and clears fileRef/originalFilename.
+     * The Document row is preserved (with its docType) so a replacement can be uploaded later via PATCH.
+     * Returns 204 No Content.
+     */
+    @DeleteMapping("/{id}/files/{docType}")
+    public ResponseEntity<Void> deleteDocumentFile(
+            @PathVariable Long id,
+            @PathVariable String docType) {
+        try {
+            submissionService.deleteDocumentFile(id, docType);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage());
+        }
+    }
+
+    /**
      * Re-runs the full extraction → verification pipeline for a submission,
      * using its current file refs. Clears previous matched line items, exceptions,
      * and audit log before starting. Returns 202 Accepted immediately.
@@ -107,6 +124,20 @@ public class SubmissionController {
             return ResponseEntity.ok(submissionService.overrideSubmission(id, request));
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+
+    /**
+     * Completely deletes a submission and all its associated data, including files from R2.
+     * Returns 204 No Content on success.
+     */
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteSubmission(@PathVariable Long id) {
+        try {
+            submissionService.deleteSubmission(id);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage());
         }
     }
 }

@@ -8,10 +8,12 @@ import com.pjl.bills.dto.SubmissionResponse;
 import com.pjl.bills.dto.SubmissionSummaryDto;
 import com.pjl.bills.entity.BillCategory;
 import com.pjl.bills.entity.Document;
+import com.pjl.bills.entity.DocumentPage;
 import com.pjl.bills.entity.MatchedLineItemEntity;
 import com.pjl.bills.entity.Submission;
 import com.pjl.bills.event.SubmissionCreatedEvent;
 import com.pjl.bills.repository.BillCategoryRepository;
+import com.pjl.bills.repository.DocumentPageRepository;
 import com.pjl.bills.repository.DocumentRepository;
 import com.pjl.bills.repository.MatchedLineItemRepository;
 import com.pjl.bills.repository.SubmissionRepository;
@@ -45,6 +47,7 @@ public class SubmissionService {
     private final BillCategoryRepository billCategoryRepository;
     private final SubmissionRepository submissionRepository;
     private final DocumentRepository documentRepository;
+    private final DocumentPageRepository documentPageRepository;
     private final AuditLogRepository auditLogRepository;
     private final MatchedLineItemRepository matchedLineItemRepository;
     private final FileStorage fileStorage;
@@ -105,6 +108,7 @@ public class SubmissionService {
                 doc.setSubmission(submission);
                 doc.setDocType(docType);
                 doc.setFileRef(key);
+                doc.setOriginalFilename(f.getOriginalFilename());
                 documentRepository.save(doc);
             } catch (IOException e) {
                 throw new IllegalArgumentException("Failed to read uploaded file for type: " + docType, e);
@@ -146,6 +150,7 @@ public class SubmissionService {
                 Document doc = docByType.get(docType);
                 if (doc != null) {
                     doc.setFileRef(key);
+                    doc.setOriginalFilename(f.getOriginalFilename());
                     documentRepository.save(doc);
                     log.info("Replaced {} file for submission {} → {}", docType, submissionId, key);
                     anyReplaced = true;
@@ -201,6 +206,7 @@ public class SubmissionService {
 
     /**
      * Retrieves a paginated list of submissions, optionally filtered by status.
+     * Includes supplierName and invoiceNo pulled from the invoice document's raw extraction.
      */
     @Transactional(readOnly = true)
     public Page<SubmissionSummaryDto> getSubmissions(String status, Pageable pageable) {
@@ -211,12 +217,29 @@ public class SubmissionService {
             page = submissionRepository.findAll(pageable);
         }
 
-        return page.map(s -> new SubmissionSummaryDto(
-                s.getId(),
-                s.getBillCategory().getName(),
-                s.getStatus(),
-                s.getUploadedAt()
-        ));
+        return page.map(s -> {
+            String supplierName = null;
+            String invoiceNo = null;
+            // Extract from invoice document's raw_extraction if available
+            List<Document> docs = documentRepository.findBySubmission(s);
+            for (Document d : docs) {
+                if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
+                    Object sn = d.getRawExtraction().get("supplier_name");
+                    Object inv = d.getRawExtraction().get("invoice_no");
+                    if (sn != null) supplierName = sn.toString();
+                    if (inv != null) invoiceNo = inv.toString();
+                    break;
+                }
+            }
+            return new SubmissionSummaryDto(
+                    s.getId(),
+                    s.getBillCategory().getName(),
+                    s.getStatus(),
+                    s.getUploadedAt(),
+                    supplierName,
+                    invoiceNo
+            );
+        });
     }
 
     /**
@@ -229,7 +252,8 @@ public class SubmissionService {
                 .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + id));
 
         List<DocumentDto> docs = documentRepository.findBySubmission(s).stream()
-                .map(d -> new DocumentDto(d.getId(), d.getDocType(), d.getFileRef(), d.getRawExtraction()))
+                .map(d -> new DocumentDto(d.getId(), d.getDocType(), d.getFileRef(),
+                        d.getOriginalFilename(), d.getRawExtraction()))
                 .toList();
 
         List<AuditLogDto> logs = auditLogRepository.findByEntityTypeAndEntityId("Submission", id).stream()
@@ -300,5 +324,79 @@ public class SubmissionService {
         log.info("Submission ID {} manually overridden from {} to {}", id, oldStatus, newStatus);
 
         return getSubmissionDetail(id);
+    }
+
+    /**
+     * Deletes a document's file from R2 and clears its fileRef/originalFilename.
+     * The Document row is kept with its docType intact so a new file can be uploaded later via PATCH.
+     */
+    @Transactional
+    public void deleteDocumentFile(Long submissionId, String docType) {
+        Submission submission = submissionRepository.findById(submissionId)
+                .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + submissionId));
+
+        List<Document> docs = documentRepository.findBySubmission(submission);
+        Document target = docs.stream()
+                .filter(d -> docType.equalsIgnoreCase(d.getDocType()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No document of type '" + docType + "' found for submission " + submissionId));
+
+        String existingKey = target.getFileRef();
+        if (existingKey != null && existingKey.contains("/")) {
+            fileStorage.deleteFile(existingKey);
+            log.info("Deleted R2 file for submission {} docType={} key={}", submissionId, docType, existingKey);
+        }
+
+        target.setFileRef(null);
+        target.setOriginalFilename(null);
+        documentRepository.save(target);
+    }
+
+    /**
+     * Completely deletes a submission and all its associated data.
+     * Deletes files from R2, then removes DocumentPages, Documents, MatchedLineItems,
+     * AuditLogs, and finally the Submission itself.
+     */
+    @Transactional
+    public void deleteSubmission(Long id) {
+        Submission submission = submissionRepository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + id));
+
+        // 1. Delete R2 files and DocumentPages
+        List<Document> docs = documentRepository.findBySubmission(submission);
+        for (Document doc : docs) {
+            // Delete main file if exists
+            String key = doc.getFileRef();
+            if (key != null && key.contains("/")) {
+                fileStorage.deleteFile(key);
+            }
+            
+            // Delete page files if any
+            List<DocumentPage> pages = documentPageRepository.findByDocumentOrderByPageOrderAsc(doc);
+            for (DocumentPage page : pages) {
+                String pageKey = page.getFileName();
+                if (pageKey != null && pageKey.contains("/")) {
+                    fileStorage.deleteFile(pageKey);
+                }
+            }
+            // Delete DocumentPage rows for this doc
+            documentPageRepository.deleteAll(pages);
+        }
+
+        // 2. Delete all MatchedLineItem rows
+        List<MatchedLineItemEntity> items = matchedLineItemRepository.findBySubmissionIdOrderByIdAsc(id);
+        matchedLineItemRepository.deleteAll(items);
+
+        // 3. Delete all audit_log entries
+        auditLogRepository.deleteByEntityTypeAndEntityId("Submission", id);
+
+        // 4. Delete all Document rows
+        documentRepository.deleteAll(docs);
+
+        // 5. Delete Submission
+        submissionRepository.delete(submission);
+
+        log.info("Deleted submission ID {} and all associated data", id);
     }
 }

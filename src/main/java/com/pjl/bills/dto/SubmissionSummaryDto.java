@@ -6,6 +6,8 @@ public record SubmissionSummaryDto(
         Long id,
         String categoryName,
         String status,
-        Instant uploadedAt
+        Instant uploadedAt,
+        String supplierName,
+        String invoiceNo
 ) {
 }

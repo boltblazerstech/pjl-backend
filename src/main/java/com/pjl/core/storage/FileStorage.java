@@ -38,15 +38,22 @@ public interface FileStorage {
 
     /**
      * Uploads raw file bytes to storage without requiring an existing Document entity.
-     * Useful for groups and other non-submission contexts.
+     * Useful for submission file uploads where we have the key prefix but no entity yet.
      *
-     * @param pathPrefix The prefix/folder in storage (e.g., "groups/123/")
+     * @param pathPrefix The prefix/folder in storage (e.g., "submissions/123/")
      * @param fileName The base file name (e.g., "invoice.pdf")
      * @param contentType The MIME type
      * @param fileBytes The file content
      * @return The unique key/reference under which the file was stored
      */
     String uploadRawFile(String pathPrefix, String fileName, String contentType, byte[] fileBytes);
+
+    /**
+     * Deletes a file from storage by its key. No-ops if the key is null or blank.
+     */
+    default void deleteFile(String key) {
+        // Default no-op — implementations that support deletion should override
+    }
 
     /**
      * Simple record for passing upload data without coupling to MultipartFile.

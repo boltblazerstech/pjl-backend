@@ -26,8 +26,12 @@ public class Document extends AuditableEntity {
     @Column(name = "doc_type", nullable = false)
     private String docType;
 
-    @Column(name = "file_ref", nullable = false)
+    @Column(name = "file_ref")
     private String fileRef;
+
+    /** The original uploaded file name (e.g. "Invoice-9.pdf"). */
+    @Column(name = "original_filename", length = 512)
+    private String originalFilename;
 
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "raw_extraction", columnDefinition = "jsonb")

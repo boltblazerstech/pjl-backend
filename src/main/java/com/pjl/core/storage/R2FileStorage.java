@@ -15,6 +15,7 @@ import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
@@ -176,5 +177,15 @@ public class R2FileStorage implements FileStorage {
         s3Client.putObject(putObjectRequest, RequestBody.fromBytes(fileBytes));
         
         return key;
+    }
+
+    @Override
+    public void deleteFile(String key) {
+        if (key == null || key.isBlank()) return;
+        log.info("Deleting file from R2 bucket: {}, key: {}", bucketName, key);
+        s3Client.deleteObject(DeleteObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build());
     }
 }
