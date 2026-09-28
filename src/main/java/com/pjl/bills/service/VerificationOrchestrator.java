@@ -62,6 +62,10 @@ public class VerificationOrchestrator {
     private final OutputSink                outputSink;
     private final FileStorage               fileStorage;
     private final ObjectMapper              objectMapper;
+    private final com.pjl.bills.repository.PoGrnLineRepository poGrnLineRepository;
+
+    @org.springframework.beans.factory.annotation.Value("${pjl.valid-gr-statuses:Freeze Acceptance,Freeze Movement}")
+    private List<String> validGrStatuses;
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Entry point — fires AFTER the upload transaction commits
@@ -99,16 +103,19 @@ public class VerificationOrchestrator {
             String strategyKey = submission.getBillCategory().getVerificationStrategyKey();
             VerificationStrategy strategy = strategyRegistry.resolve(strategyKey);
 
-            // Step 3: Extract all documents
+            if ("ramco_import".equals(submission.getPoGrnSource())) {
+                runBatchInvoicePipeline(submission, strategy);
+                return;
+            }
+
+            // Normal 3-file flow
             List<Document> documents = documentRepository.findBySubmission(submission);
             boolean extractionOk = extractAllDocuments(submission, strategy, documents);
 
             if (!extractionOk) {
-                // extractAllDocuments already set FAILED and wrote the audit log
                 return;
             }
 
-            // Step 4: Re-fetch documents so rawExtraction is populated from DB
             documents = documentRepository.findBySubmission(submission);
 
             // Step 5: Run verification
@@ -128,6 +135,264 @@ public class VerificationOrchestrator {
                     "Unexpected orchestration error: " + e.getClass().getSimpleName()
                     + " — " + e.getMessage());
         }
+    }
+
+    private void runBatchInvoicePipeline(Submission submission, VerificationStrategy strategy) {
+        List<Document> documents = documentRepository.findBySubmission(submission);
+        Document invoiceDoc = documents.stream().filter(d -> "invoice".equals(d.getDocType())).findFirst().orElse(null);
+        if (invoiceDoc == null) {
+            markFailed(submission, "No invoice document found in submission.");
+            return;
+        }
+
+        try {
+            byte[] fileBytes = fileStorage.retrieve(invoiceDoc);
+            if (fileBytes == null) {
+                markFailed(submission, "Invoice file not found in storage.");
+                return;
+            }
+
+            log.info("[Orchestrator] Running BATCH extraction for submission id={}", submission.getId());
+            String prompt = com.pjl.bills.spares.SparesExtractionPrompts.BATCH_EXTRACTION_PROMPT;
+            com.fasterxml.jackson.databind.JsonNode root = geminiExtractionService.extractFromMultipleFiles(
+                    List.of(fileBytes), 
+                    List.of("application/pdf"), 
+                    prompt);
+
+            if (root == null) {
+                markFailed(submission, "Failed to parse batch invoice extraction result.");
+                return;
+            }
+
+            com.fasterxml.jackson.databind.JsonNode invoicesNode = root.get("invoices");
+            if (invoicesNode == null || !invoicesNode.isArray() || invoicesNode.isEmpty()) {
+                markFailed(submission, "No invoices were extracted from the PDF.");
+                return;
+            }
+            
+            com.fasterxml.jackson.databind.node.ArrayNode invoices = (com.fasterxml.jackson.databind.node.ArrayNode) invoicesNode;
+            log.info("[Orchestrator] Found {} invoices in submission id={}", invoices.size(), submission.getId());
+
+            // Process the first invoice using the current submission
+            processSingleExtractedInvoice(submission, invoiceDoc, invoices.get(0), strategy);
+
+            // Spawn new submissions for the remaining invoices
+            for (int i = 1; i < invoices.size(); i++) {
+                try {
+                    Submission newSub = new Submission();
+                    newSub.setBillCategory(submission.getBillCategory());
+                    newSub.setStatus("PROCESSING");
+                    newSub.setUploadedAt(java.time.Instant.now());
+                    newSub.setPoGrnSource("ramco_import");
+                    newSub = submissionRepository.save(newSub);
+
+                    Document newDoc = new Document();
+                    newDoc.setSubmission(newSub);
+                    newDoc.setDocType("invoice");
+                    newDoc.setFileRef(invoiceDoc.getFileRef());
+                    newDoc.setOriginalFilename(invoiceDoc.getOriginalFilename());
+                    newDoc = documentRepository.save(newDoc);
+
+                    log.info("[Orchestrator] Spawned new submission id={} for invoice #{}", newSub.getId(), i + 1);
+                    processSingleExtractedInvoice(newSub, newDoc, invoices.get(i), strategy);
+                } catch (Exception ex) {
+                    log.error("[Orchestrator] Failed to spawn and process invoice #{}", i + 1, ex);
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("[Orchestrator] Unexpected failure during batch extraction for submission id={}", submission.getId(), e);
+            markFailed(submission, "Unexpected orchestration error: " + e.getMessage());
+        }
+    }
+
+    private void processSingleExtractedInvoice(Submission submission, Document invoiceDoc, JsonNode extractionNode, VerificationStrategy strategy) {
+        try {
+            java.util.Map<String, Object> map = objectMapper.convertValue(extractionNode, new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Object>>() {});
+            invoiceDoc.setRawExtraction(map);
+            documentRepository.save(invoiceDoc);
+
+            boolean synthOk = synthesizePoGrnDocuments(submission);
+            if (!synthOk) return; // Stays AWAITING_PO_GRN
+
+            List<Document> currentDocs = documentRepository.findBySubmission(submission);
+            VerifiedSubmissionResult result = strategy.verify(submission, currentDocs);
+            outputSink.saveVerifiedSubmission(result);
+            log.info("[Orchestrator] Processing complete for submission id={}, status={}", submission.getId(), result.finalStatus());
+        } catch (Exception e) {
+            log.error("[Orchestrator] Failed to process single invoice for submission id={}", submission.getId(), e);
+            markFailed(submission, "Error processing invoice: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Resumes verification for a submission that was AWAITING_PO_GRN.
+     */
+    @Async("verificationExecutor")
+    public void verifyOnly(Long submissionId) {
+        Submission submission = submissionRepository.findById(submissionId).orElse(null);
+        if (submission == null) return;
+
+        try {
+            setStatus(submission, "PROCESSING");
+            String strategyKey = submission.getBillCategory().getVerificationStrategyKey();
+            VerificationStrategy strategy = strategyRegistry.resolve(strategyKey);
+            
+            if ("ramco_import".equals(submission.getPoGrnSource())) {
+                boolean synthOk = synthesizePoGrnDocuments(submission);
+                if (!synthOk) return; 
+            }
+
+            List<Document> documents = documentRepository.findBySubmission(submission);
+            
+            log.info("[Orchestrator] Running reverification for submission id={}", submission.getId());
+            VerifiedSubmissionResult result = strategy.verify(submission, documents);
+            outputSink.saveVerifiedSubmission(result);
+            
+            log.info("[Orchestrator] Reverification complete for submission id={} — final status={}",
+                    submission.getId(), result.finalStatus());
+        } catch (Exception e) {
+            log.error("[Orchestrator] Unexpected failure for submission id={}", submission.getId(), e);
+            markFailed(submission, "Unexpected orchestration error: " + e.getClass().getSimpleName() + " — " + e.getMessage());
+        }
+    }
+
+    private boolean synthesizePoGrnDocuments(Submission submission) {
+        // Find invoice document to get PO Number
+        List<Document> allDocs = documentRepository.findBySubmission(submission);
+        Document invoiceDoc = allDocs.stream()
+                .filter(d -> "invoice".equals(d.getDocType()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Invoice document missing for submission " + submission.getId()));
+
+        Map<String, Object> invMap = invoiceDoc.getRawExtraction();
+        if (invMap == null || !invMap.containsKey("po_number") || invMap.get("po_number") == null) {
+            markAwaitingPoGrn(submission, "Invoice extraction missing PO number. Cannot lookup PO/GRN in Ramco data.");
+            return false;
+        }
+        
+        String poNumber = String.valueOf(invMap.get("po_number")).trim();
+        List<com.pjl.bills.entity.PoGrnLine> lines = poGrnLineRepository.findByPoNumber(poNumber);
+        
+        // Filter by valid GR statuses
+        List<String> validStatusesLower = validGrStatuses.stream().map(String::toLowerCase).map(String::trim).toList();
+        
+        List<com.pjl.bills.entity.PoGrnLine> validLines = lines.stream()
+                .filter(l -> l.getGrStatus() == null || validStatusesLower.contains(l.getGrStatus().toLowerCase().trim()))
+                .toList();
+
+        if (validLines.isEmpty()) {
+            markAwaitingPoGrn(submission, "Waiting for Ramco PO/GRN import for PO: " + poNumber);
+            return false;
+        }
+
+        // Find max amendment no
+        int maxAmend = validLines.stream()
+                .map(l -> {
+                    try { return l.getPoAmendmentNo() != null ? Integer.parseInt(l.getPoAmendmentNo()) : 0; }
+                    catch (Exception e) { return 0; }
+                })
+                .max(Integer::compareTo)
+                .orElse(0);
+
+        List<com.pjl.bills.entity.PoGrnLine> currentLines = validLines.stream()
+                .filter(l -> {
+                    try { return (l.getPoAmendmentNo() != null ? Integer.parseInt(l.getPoAmendmentNo()) : 0) == maxAmend; }
+                    catch (Exception e) { return maxAmend == 0; }
+                })
+                .toList();
+
+        if (currentLines.isEmpty()) {
+             markAwaitingPoGrn(submission, "No valid amendment rows found for PO: " + poNumber);
+             return false;
+        }
+
+        // Synthesize PO Document
+        Document poDoc = new Document();
+        poDoc.setSubmission(submission);
+        poDoc.setDocType("po");
+        
+        var poFirst = currentLines.getFirst();
+        Map<String, Object> poNode = new java.util.HashMap<>();
+        poNode.put("po_number", poFirst.getPoNumber());
+        poNode.put("supplier_name", poFirst.getSupplierName());
+        poNode.put("supplier_code", poFirst.getSupplierCode());
+        poNode.put("pay_term", poFirst.getPaytermDesc());
+        List<Map<String, Object>> poItems = new java.util.ArrayList<>();
+        poNode.put("line_items", poItems);
+        
+        // Group PO lines by poLineNo
+        Map<Integer, List<com.pjl.bills.entity.PoGrnLine>> byPoLine = currentLines.stream()
+                .collect(java.util.stream.Collectors.groupingBy(com.pjl.bills.entity.PoGrnLine::getPoLineNo));
+                
+        for (var entry : byPoLine.entrySet()) {
+            var lineGrp = entry.getValue().getFirst();
+            Map<String, Object> item = new java.util.HashMap<>();
+            item.put("description", lineGrp.getItemDesc());
+            item.put("item_code", lineGrp.getItemCode());
+            item.put("quantity", lineGrp.getPoOrderQty());
+            item.put("rate", lineGrp.getPoUnitRate());
+            item.put("amount", lineGrp.getPoLineValue());
+            item.put("discount_percent", 0);
+            poItems.add(item);
+        }
+        poDoc.setRawExtraction(poNode);
+        documentRepository.save(poDoc);
+
+        // Synthesize GRN Document
+        Document grnDoc = new Document();
+        grnDoc.setSubmission(submission);
+        grnDoc.setDocType("grn");
+        
+        String invoiceNo = (invMap.containsKey("invoice_no") && invMap.get("invoice_no") != null) 
+                ? String.valueOf(invMap.get("invoice_no")).trim() : null;
+        
+        Map<String, Object> grnNode = new java.util.HashMap<>();
+        grnNode.put("grn_number", poFirst.getGrNo());
+        if (poFirst.getGrDate() != null) grnNode.put("grn_date", poFirst.getGrDate().toString());
+        List<Map<String, Object>> grnItems = new java.util.ArrayList<>();
+        grnNode.put("line_items", grnItems);
+
+        for (var entry : byPoLine.entrySet()) {
+            List<com.pjl.bills.entity.PoGrnLine> lineGrp = entry.getValue();
+            Map<String, Object> item = new java.util.HashMap<>();
+            item.put("description", lineGrp.getFirst().getItemDesc());
+            item.put("item_code", lineGrp.getFirst().getItemCode());
+            
+            BigDecimal accepted = BigDecimal.ZERO;
+            boolean matchedInvoice = false;
+            if (invoiceNo != null) {
+                for (var grnLine : lineGrp) {
+                    if (invoiceNo.equalsIgnoreCase(grnLine.getDelynoten())) {
+                        accepted = accepted.add(grnLine.getAcceptedQty() != null ? grnLine.getAcceptedQty() : (grnLine.getReceivedQty() != null ? grnLine.getReceivedQty() : BigDecimal.ZERO));
+                        matchedInvoice = true;
+                    }
+                }
+            }
+            if (!matchedInvoice) {
+                for (var grnLine : lineGrp) {
+                    accepted = accepted.add(grnLine.getAcceptedQty() != null ? grnLine.getAcceptedQty() : (grnLine.getReceivedQty() != null ? grnLine.getReceivedQty() : BigDecimal.ZERO));
+                }
+            }
+            item.put("quantity", accepted);
+            grnItems.add(item);
+        }
+        grnDoc.setRawExtraction(grnNode);
+        documentRepository.save(grnDoc);
+        
+        return true;
+    }
+
+    private void markAwaitingPoGrn(Submission submission, String reason) {
+        setStatus(submission, "AWAITING_PO_GRN");
+        AuditLog exceptionLog = new AuditLog();
+        exceptionLog.setEntityType(ENTITY_TYPE);
+        exceptionLog.setEntityId(submission.getId());
+        exceptionLog.setAction("WAITING_DATA");
+        exceptionLog.setDetail(reason);
+        exceptionLog.setActor("system");
+        auditLogRepository.save(exceptionLog);
+        log.info("[Orchestrator] Submission id={} is AWAITING_PO_GRN: {}", submission.getId(), reason);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

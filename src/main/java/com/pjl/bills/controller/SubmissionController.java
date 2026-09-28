@@ -41,6 +41,21 @@ public class SubmissionController {
     }
 
     /**
+     * Creates an invoice-only submission.
+     */
+    @PostMapping("/invoice-only")
+    public ResponseEntity<SubmissionResponse> createInvoiceOnlySubmission(
+            @RequestParam("billCategoryId") Long billCategoryId,
+            @RequestParam("invoice") org.springframework.web.multipart.MultipartFile invoiceFile) {
+        try {
+            SubmissionResponse response = submissionService.createInvoiceOnlySubmission(billCategoryId, invoiceFile);
+            return ResponseEntity.accepted().body(response);
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        }
+    }
+
+    /**
      * Replaces one or more files on an existing submission.
      * At least one file (invoice, po, grn) must be provided in the multipart body.
      * The old R2 objects are orphaned (not deleted).

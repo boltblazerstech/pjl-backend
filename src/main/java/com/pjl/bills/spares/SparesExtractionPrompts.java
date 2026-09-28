@@ -53,4 +53,52 @@ public final class SparesExtractionPrompts {
             - warranty_text: Extract the raw prose regarding warranty directly from the Invoice.
             - po_warranty_requirement: Extract the raw prose regarding warranty requirement directly from the PO. Keep this separate from warranty_text so they can be compared later.
             """;
+
+    public static final String BATCH_EXTRACTION_PROMPT = """
+            Extract data from the provided document(s) and output ONLY a valid JSON object matching the exact schema below.
+            
+            IMPORTANT: The provided document may contain MULTIPLE invoices (e.g., 9 different invoices in a single PDF). 
+            You must find EVERY invoice in the document and return them as an array of objects.
+            
+            SCHEMA:
+            {
+              "invoices": [
+                {
+                  "grn_present": boolean,
+                  "po_number": string or null,
+                  "grn_number": string or null,
+                  "grn_date": string (DD/MM/YYYY) or null,
+                  "supplier_code": string or null,
+                  "cost_center": string or null,
+                  "analysis_code": string or null,
+                  "sub_analysis_code": string or null,
+                  "supplier_name": string,
+                  "supplier_gstin": string or null,
+                  "invoice_no": string,
+                  "invoice_date": string (DD/MM/YYYY),
+                  "pay_term": string or null,
+                  "warranty_text": string or null,
+                  "po_warranty_requirement": string or null,
+                  "is_rcm": boolean,
+                  "line_items": [{ "description": string, "hsn_sac": string or null,
+                    "uom": string or null, "quantity": number, "rate": number,
+                    "discount_percent": number or null,
+                    "amount": number }],
+                  "cgst_amount": number or null,
+                  "sgst_amount": number or null,
+                  "igst_amount": number or null,
+                  "other_charges": number or null,
+                  "total_amount": number,
+                  "amount_in_words": string or null
+                }
+              ]
+            }
+            
+            FIELD NOTES AND INSTRUCTIONS:
+            - line_items: IMPORTANT! You MUST extract EVERY SINGLE line item for each invoice. Do not summarize, skip, or truncate any line items.
+            - Extract every distinct invoice you find in the PDF. If there are 9 invoices, the "invoices" array must have 9 objects.
+            - igst_amount: Extract the IGST amount if present (inter-state supply).
+            - other_charges: Sum of any additional charges outside the line items — freight, packing, insurance, loading, etc.
+            - is_rcm: If true, it means nil GST is expected.
+            """;
 }

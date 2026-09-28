@@ -36,4 +36,10 @@ public class Submission extends AuditableEntity {
      */
     @Column(name = "warranty_status", length = 20)
     private String warrantyStatus;
+
+    @Column(name = "po_grn_source", length = 50)
+    private String poGrnSource = "upload";
+
+    @Column(name = "po_grn_import_batch_id")
+    private Long poGrnImportBatchId;
 }

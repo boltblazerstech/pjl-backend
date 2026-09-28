@@ -124,6 +124,45 @@ public class SubmissionService {
     }
 
     /**
+     * Creates an invoice-only submission using imported Ramco PO/GRN data.
+     */
+    @Transactional
+    public SubmissionResponse createInvoiceOnlySubmission(Long billCategoryId, MultipartFile invoiceFile) {
+        BillCategory category = billCategoryRepository.findById(billCategoryId)
+                .orElseThrow(() -> new IllegalArgumentException("BillCategory not found for ID: " + billCategoryId));
+
+        if (invoiceFile == null || invoiceFile.isEmpty()) {
+            throw new IllegalArgumentException("Invoice file is required for invoice-only submission.");
+        }
+
+        Submission submission = new Submission();
+        submission.setBillCategory(category);
+        submission.setStatus("PENDING");
+        submission.setUploadedAt(Instant.now());
+        submission.setPoGrnSource("ramco_import");
+        submission = submissionRepository.save(submission);
+
+        String prefix = "submissions/" + submission.getId() + "/";
+        try {
+            String key = fileStorage.uploadRawFile(prefix, invoiceFile.getOriginalFilename(),
+                    invoiceFile.getContentType(), invoiceFile.getBytes());
+            Document doc = new Document();
+            doc.setSubmission(submission);
+            doc.setDocType("invoice");
+            doc.setFileRef(key);
+            doc.setOriginalFilename(invoiceFile.getOriginalFilename());
+            documentRepository.save(doc);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to upload invoice file", e);
+        }
+
+        log.info("Publishing SubmissionCreatedEvent for invoice-only submission {}", submission.getId());
+        eventPublisher.publishEvent(new SubmissionCreatedEvent(this, submission.getId()));
+
+        return new SubmissionResponse(submission.getId(), submission.getStatus());
+    }
+
+    /**
      * Replaces one or more files on an existing submission. At least one file must be provided.
      * Each provided file is uploaded to R2 and the corresponding Document row's fileRef is updated.
      * The old R2 object is intentionally left in place (orphaned) — cleanup is out of scope for now.
@@ -194,6 +233,16 @@ public class SubmissionService {
         submission.setStatus("PENDING");
         submission.setWarrantyStatus(null);
         submissionRepository.save(submission);
+
+        // For invoice-only, clear the synthesized PO/GRN documents so they are regenerated
+        if ("ramco_import".equals(submission.getPoGrnSource())) {
+            List<Document> docs = documentRepository.findBySubmission(submission);
+            for (Document doc : docs) {
+                if ("po".equals(doc.getDocType()) || "grn".equals(doc.getDocType())) {
+                    documentRepository.delete(doc);
+                }
+            }
+        }
 
         log.info("Rerun initiated for submission {} — cleared {} line items and all audit logs",
                 submissionId, items.size());
@@ -291,7 +340,9 @@ public class SubmissionService {
                 docs,
                 logs,
                 exceptions,
-                matchedLineItems
+                matchedLineItems,
+                s.getPoGrnSource(),
+                s.getPoGrnImportBatchId()
         );
     }
 

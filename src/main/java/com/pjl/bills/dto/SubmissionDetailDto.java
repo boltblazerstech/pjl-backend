@@ -13,6 +13,8 @@ public record SubmissionDetailDto(
         List<DocumentDto> documents,
         List<AuditLogDto> auditLogs,
         List<AuditLogDto> exceptions,
-        List<MatchedLineItemDto> matchedLineItems
+        List<MatchedLineItemDto> matchedLineItems,
+        String poGrnSource,
+        Long poGrnImportBatchId
 ) {
 }
