@@ -29,7 +29,7 @@ public class PoGrnLineController {
             @PageableDefault(sort = "id", direction = Sort.Direction.DESC) Pageable pageable) {
         
         if (batchId != null) {
-            return ResponseEntity.ok(poGrnLineRepository.findByImportBatchId(batchId, pageable));
+            return ResponseEntity.ok(poGrnLineRepository.findByImportBatch_Id(batchId, pageable));
         } else if (StringUtils.hasText(search)) {
             return ResponseEntity.ok(poGrnLineRepository.findByPoNumberContainingIgnoreCase(search, pageable));
         } else {

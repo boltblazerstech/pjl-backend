@@ -14,7 +14,7 @@ public interface PoGrnLineRepository extends JpaRepository<PoGrnLine, Long> {
 
     List<PoGrnLine> findByPoNumber(String poNumber);
 
-    org.springframework.data.domain.Page<PoGrnLine> findByImportBatchId(Long importBatchId, org.springframework.data.domain.Pageable pageable);
+    org.springframework.data.domain.Page<PoGrnLine> findByImportBatch_Id(Long importBatchId, org.springframework.data.domain.Pageable pageable);
 
     org.springframework.data.domain.Page<PoGrnLine> findByPoNumberContainingIgnoreCase(String poNumber, org.springframework.data.domain.Pageable pageable);
 }
