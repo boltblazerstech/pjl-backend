@@ -273,10 +273,10 @@ public class SubmissionService {
             List<Document> docs = documentRepository.findBySubmission(s);
             for (Document d : docs) {
                 if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
-                    Object sn = d.getRawExtraction().get("supplier_name");
-                    Object inv = d.getRawExtraction().get("invoice_no");
-                    if (sn != null) supplierName = sn.toString();
-                    if (inv != null) invoiceNo = inv.toString();
+                    com.fasterxml.jackson.databind.JsonNode sn = d.getRawExtraction().get("supplier_name");
+                    com.fasterxml.jackson.databind.JsonNode inv = d.getRawExtraction().get("invoice_no");
+                    if (sn != null) supplierName = sn.asText();
+                    if (inv != null) invoiceNo = inv.asText();
                     break;
                 }
             }
