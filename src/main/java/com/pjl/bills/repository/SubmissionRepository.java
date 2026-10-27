@@ -10,4 +10,6 @@ import org.springframework.stereotype.Repository;
 public interface SubmissionRepository extends JpaRepository<Submission, Long> {
 
     Page<Submission> findByStatus(String status, Pageable pageable);
+
+    java.util.List<Submission> findByStatus(String status);
 }

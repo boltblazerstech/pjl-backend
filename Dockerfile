@@ -23,4 +23,4 @@ ENV PORT=8080
 EXPOSE $PORT
 
 # Use sh -c to ensure the PORT environment variable is evaluated at container startup
-ENTRYPOINT ["sh", "-c", "java -jar app.jar --server.port=${PORT}"]
+ENTRYPOINT ["sh", "-c", "java -XX:+UseSerialGC -Xms128m -Xmx350m -XX:+ExitOnOutOfMemoryError -jar app.jar --server.port=${PORT}"]
