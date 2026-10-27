@@ -46,10 +46,10 @@ public class PoGrnLine extends AuditableEntity {
     @Column(name = "supplier_code", length = 100)
     private String supplierCode;
 
-    @Column(name = "supplier_name", length = 255)
+    @Column(name = "supplier_name", columnDefinition = "TEXT")
     private String supplierName;
 
-    @Column(name = "payterm_desc", length = 255)
+    @Column(name = "payterm_desc", columnDefinition = "TEXT")
     private String paytermDesc;
 
     @Column(name = "gr_no", length = 100)
@@ -70,7 +70,7 @@ public class PoGrnLine extends AuditableEntity {
     @Column(name = "item_code", length = 100)
     private String itemCode;
 
-    @Column(name = "item_desc", length = 512)
+    @Column(name = "item_desc", columnDefinition = "TEXT")
     private String itemDesc;
 
     @Column(name = "delivery_note_qty")
@@ -109,7 +109,7 @@ public class PoGrnLine extends AuditableEntity {
     @Column(name = "ou_id", length = 100)
     private String ouId;
 
-    @Column(name = "ou_name", length = 255)
+    @Column(name = "ou_name", columnDefinition = "TEXT")
     private String ouName;
 
     @Column(name = "imported_at", nullable = false)

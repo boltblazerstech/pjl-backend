@@ -300,13 +300,16 @@ public class PoGrnImportService {
                         buffer.add(data);
                         stats.rowsRead++;
                         stats.distinctPos.add(poNumber);
-
-                        if (buffer.size() >= BATCH_SIZE) {
-                            flushBatch(buffer, batchId, importedAt, nowTs);
-                            buffer.clear();
-                        }
                     } catch (Exception ex) {
                         stats.rowsSkipped++;
+                    }
+
+                    if (buffer.size() >= BATCH_SIZE) {
+                        try {
+                            flushBatch(buffer, batchId, importedAt, nowTs);
+                        } finally {
+                            buffer.clear();
+                        }
                     }
                 }
 
@@ -416,13 +419,16 @@ public class PoGrnImportService {
                     buffer.add(data);
                     stats.rowsRead++;
                     stats.distinctPos.add(poNumber);
-
-                    if (buffer.size() >= BATCH_SIZE) {
-                        flushBatch(buffer, batchId, importedAt, nowTs);
-                        buffer.clear();
-                    }
                 } catch (Exception ex) {
                     stats.rowsSkipped++;
+                }
+
+                if (buffer.size() >= BATCH_SIZE) {
+                    try {
+                        flushBatch(buffer, batchId, importedAt, nowTs);
+                    } finally {
+                        buffer.clear();
+                    }
                 }
             }
 
