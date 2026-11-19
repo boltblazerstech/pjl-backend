@@ -192,6 +192,23 @@ public class PoGrnImportService {
         );
     }
 
+    @Transactional
+    public void deleteBatch(Long id) {
+        log.info("Deleting PO/GRN import batch id={}", id);
+        jdbcTemplate.update("UPDATE submission SET po_grn_import_batch_id = NULL WHERE po_grn_import_batch_id = ?", id);
+        int linesDeleted = jdbcTemplate.update("DELETE FROM po_grn_line WHERE import_batch_id = ?", id);
+        poGrnImportBatchRepository.deleteById(id);
+        log.info("Deleted PO/GRN import batch id={} and {} associated lines", id, linesDeleted);
+    }
+
+    @Transactional
+    public void deleteBatches(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) return;
+        for (Long id : ids) {
+            deleteBatch(id);
+        }
+    }
+
     private int triggerWaitingSubmissions(Set<String> distinctPos) {
         if (distinctPos == null || distinctPos.isEmpty()) return 0;
 

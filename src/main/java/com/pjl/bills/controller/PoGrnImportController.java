@@ -31,4 +31,16 @@ public class PoGrnImportController {
     public ResponseEntity<List<PoGrnImportBatch>> listImports() {
         return ResponseEntity.ok(poGrnImportBatchRepository.findAllByOrderByImportedAtDesc());
     }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteBatch(@PathVariable Long id) {
+        poGrnImportService.deleteBatch(id);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/batch-delete")
+    public ResponseEntity<Void> deleteBatches(@RequestBody List<Long> ids) {
+        poGrnImportService.deleteBatches(ids);
+        return ResponseEntity.noContent().build();
+    }
 }
