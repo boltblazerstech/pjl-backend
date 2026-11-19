@@ -85,6 +85,11 @@ public class GeminiExtractionService {
             // 1st pass: parse the full cleaned response
             JsonNode result = tryParse(cleanJson);
             if (result != null) {
+                // If Gemini wrapped a single object in an array [ { ... } ], unwrap it
+                if (result.isArray() && result.size() == 1 && result.get(0).isObject()) {
+                    log.info("[Gemini] Unwrapped single-object array from extraction response.");
+                    return result.get(0);
+                }
                 return result;
             }
 

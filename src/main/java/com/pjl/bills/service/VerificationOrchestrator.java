@@ -28,6 +28,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -165,6 +166,9 @@ public class VerificationOrchestrator {
             }
 
             com.fasterxml.jackson.databind.JsonNode invoicesNode = root.get("invoices");
+            if (invoicesNode == null && root.isArray()) {
+                invoicesNode = root;
+            }
             if (invoicesNode == null || !invoicesNode.isArray() || invoicesNode.isEmpty()) {
                 markFailed(submission, "No invoices were extracted from the PDF.");
                 return;
@@ -208,7 +212,15 @@ public class VerificationOrchestrator {
 
     private void processSingleExtractedInvoice(Submission submission, Document invoiceDoc, JsonNode extractionNode, VerificationStrategy strategy) {
         try {
-            java.util.Map<String, Object> map = objectMapper.convertValue(extractionNode, new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Object>>() {});
+            JsonNode nodeToProcess = extractionNode;
+            if (nodeToProcess != null && nodeToProcess.isArray()) {
+                if (!nodeToProcess.isEmpty() && nodeToProcess.get(0).isObject()) {
+                    nodeToProcess = nodeToProcess.get(0);
+                }
+            }
+
+            java.util.Map<String, Object> map = objectMapper.convertValue(
+                    nodeToProcess, new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Object>>() {});
             invoiceDoc.setRawExtraction(map);
             documentRepository.save(invoiceDoc);
 
@@ -516,6 +528,11 @@ public class VerificationOrchestrator {
             JsonNode extracted = geminiExtractionService.extractFromMultipleFiles(
                     fileBytes, mimeTypes, prompt);
 
+            if (extracted != null && extracted.isArray() && !extracted.isEmpty() && extracted.get(0).isObject()) {
+                log.info("[Orchestrator] extractWithValidation: Unwrapped single/first object from array for doc id={}", doc.getId());
+                extracted = extracted.get(0);
+            }
+
             // Check if reconciliation is possible (skip for docs where all line amounts = 0)
             BigDecimal gap = computeReconciliationGap(extracted);
             int lineCount = countLineItems(extracted);
@@ -622,6 +639,9 @@ public class VerificationOrchestrator {
         try {
             JsonNode secondResult = geminiExtractionService.extractFromMultipleFiles(
                     fileBytes, mimeTypes, basePrompt);
+            if (secondResult != null && secondResult.isArray() && !secondResult.isEmpty() && secondResult.get(0).isObject()) {
+                secondResult = secondResult.get(0);
+            }
             int secondLineCount = countLineItems(secondResult);
 
             if (firstLineCount == secondLineCount) {
@@ -819,13 +839,34 @@ public class VerificationOrchestrator {
 
     @Transactional
     protected void persistExtraction(Document doc, JsonNode extracted) {
+        if (extracted == null) {
+            log.warn("[Orchestrator] extracted is null for document id={}", doc.getId());
+            return;
+        }
+
+        JsonNode nodeToPersist = extracted;
+        if (nodeToPersist.isArray()) {
+            if (!nodeToPersist.isEmpty() && nodeToPersist.get(0).isObject()) {
+                log.info("[Orchestrator] persistExtraction: Unwrapping array (size {}) for doc id={}",
+                        nodeToPersist.size(), doc.getId());
+                nodeToPersist = nodeToPersist.get(0);
+            } else {
+                Map<String, Object> wrapper = new HashMap<>();
+                wrapper.put("items", objectMapper.convertValue(nodeToPersist, new TypeReference<List<Object>>() {}));
+                doc.setRawExtraction(wrapper);
+                documentRepository.save(doc);
+                log.info("[Orchestrator] Persisted array items wrapper for doc id={}", doc.getId());
+                return;
+            }
+        }
+
         // IMPORTANT: must use ObjectMapper.convertValue() — NOT manual entry.getValue() iteration.
         // entry.getValue() returns JsonNode instances; putting those into Map<String, Object>
         // causes Hibernate's JSONB serializer to store null (it cannot handle JsonNode values).
         // convertValue() walks the full tree and produces native Java types (String, Number,
         // List, Map) that Hibernate serializes correctly to the jsonb column.
         Map<String, Object> extractionMap = objectMapper.convertValue(
-                extracted, new TypeReference<Map<String, Object>>() {});
+                nodeToPersist, new TypeReference<Map<String, Object>>() {});
         doc.setRawExtraction(extractionMap);
         documentRepository.save(doc);
         log.debug("[Orchestrator] Persisted raw_extraction for document id={} docType={} — keys: {}",
