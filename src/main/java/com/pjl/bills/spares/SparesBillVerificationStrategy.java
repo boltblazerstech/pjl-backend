@@ -546,10 +546,10 @@ public class SparesBillVerificationStrategy implements VerificationStrategy, Pro
     private void checkQuantity(JsonNode invLine, JsonNode grnLine, int lineIndex,
                                List<VerificationException> exceptions) {
         int invQty = intOrZero(invLine, "quantity");
-        // GRN may report received/accepted qty — use "quantity" which represents accepted
+        // GRN reports accepted qty — use "quantity" which represents accepted
         int grnQty = intOrZero(grnLine, "quantity");
 
-        if (grnQty > 0 && invQty > grnQty) {
+        if (invQty > grnQty) {
             exceptions.add(new VerificationException("QTY_EXCEEDS_GRN",
                     String.format("Invoice line #%d: invoiced quantity (%d) exceeds GRN accepted quantity (%d).",
                             lineIndex + 1, invQty, grnQty)));
