@@ -101,4 +101,79 @@ public final class SparesExtractionPrompts {
             - other_charges: Sum of any additional charges outside the line items — freight, packing, insurance, loading, etc.
             - is_rcm: If true, it means nil GST is expected.
             """;
+
+    public static final String BATCH_GRN_EXTRACTION_PROMPT = """
+            Extract data from the provided Goods Receipt Note (GRN) document(s) and output ONLY a valid JSON object matching the exact schema below.
+            
+            IMPORTANT: The provided document may contain MULTIPLE Goods Receipt Notes across multiple pages.
+            You must find EVERY distinct Goods Receipt Note in the document and return them as an array of objects.
+            
+            SCHEMA:
+            {
+              "grns": [
+                {
+                  "grn_number": string,
+                  "po_number": string or null,
+                  "supplier_invoice_no": string or null,
+                  "supplier_name": string or null,
+                  "grn_date": string (DD/MM/YYYY) or null,
+                  "supplier_code": string or null,
+                  "cost_center": string or null,
+                  "analysis_code": string or null,
+                  "sub_analysis_code": string or null,
+                  "line_items": [
+                    {
+                      "item_code": string or null,
+                      "description": string,
+                      "uom": string or null,
+                      "order_qty": number or null,
+                      "quantity": number,
+                      "rejected_qty": number or null,
+                      "amount": number or null
+                    }
+                  ]
+                }
+              ]
+            }
+            
+            FIELD NOTES AND INSTRUCTIONS:
+            - "quantity": MUST be the Accepted Quantity on the GRN line.
+            - "supplier_invoice_no": The supplier's invoice number referenced on the GRN page.
+            - Extract every distinct GRN page/document found in the file.
+            """;
+
+    public static final String BATCH_PO_EXTRACTION_PROMPT = """
+            Extract data from the provided Purchase Order (PO) document(s) and output ONLY a valid JSON object matching the exact schema below.
+            
+            IMPORTANT: The document may contain MULTIPLE Purchase Orders or multi-page Purchase Orders.
+            Extract all distinct Purchase Orders found and return them as an array of objects.
+            
+            SCHEMA:
+            {
+              "pos": [
+                {
+                  "po_number": string,
+                  "po_date": string (DD/MM/YYYY) or null,
+                  "supplier_name": string or null,
+                  "total_amount": number or null,
+                  "po_warranty_requirement": string or null,
+                  "line_items": [
+                    {
+                      "item_code": string or null,
+                      "description": string,
+                      "uom": string or null,
+                      "quantity": number,
+                      "rate": number,
+                      "unit_price": number or null,
+                      "amount": number
+                    }
+                  ]
+                }
+              ]
+            }
+            
+            FIELD NOTES AND INSTRUCTIONS:
+            - Group lines by their distinct po_number.
+            - Extract EVERY line item for each PO.
+            """;
 }

@@ -8,6 +8,7 @@ public record SubmissionSummaryDto(
         String status,
         Instant uploadedAt,
         String supplierName,
-        String invoiceNo
+        String invoiceNo,
+        Integer invoiceCount
 ) {
 }

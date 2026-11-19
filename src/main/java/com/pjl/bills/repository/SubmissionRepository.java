@@ -12,4 +12,10 @@ public interface SubmissionRepository extends JpaRepository<Submission, Long> {
     Page<Submission> findByStatus(String status, Pageable pageable);
 
     java.util.List<Submission> findByStatus(String status);
+
+    java.util.List<Submission> findByParentSubmissionIdOrderByIdAsc(Long parentSubmissionId);
+
+    Page<Submission> findByParentSubmissionIdIsNull(Pageable pageable);
+
+    Page<Submission> findByStatusAndParentSubmissionIdIsNull(String status, Pageable pageable);
 }

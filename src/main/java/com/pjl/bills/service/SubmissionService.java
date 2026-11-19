@@ -32,12 +32,15 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.multipart.MultipartHttpServletRequest;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -261,32 +264,57 @@ public class SubmissionService {
     public Page<SubmissionSummaryDto> getSubmissions(String status, Pageable pageable) {
         Page<Submission> page;
         if (status != null && !status.isBlank()) {
-            page = submissionRepository.findByStatus(status, pageable);
+            page = submissionRepository.findByStatusAndParentSubmissionIdIsNull(status, pageable);
         } else {
-            page = submissionRepository.findAll(pageable);
+            page = submissionRepository.findByParentSubmissionIdIsNull(pageable);
         }
 
         return page.map(s -> {
+            List<Submission> children = submissionRepository.findByParentSubmissionIdOrderByIdAsc(s.getId());
+            int invoiceCount = children.isEmpty() ? 1 : children.size();
+
             String supplierName = null;
             String invoiceNo = null;
-            // Extract from invoice document's raw_extraction if available
-            List<Document> docs = documentRepository.findBySubmission(s);
-            for (Document d : docs) {
-                if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
-                    Object sn = d.getRawExtraction().get("supplier_name");
-                    Object inv = d.getRawExtraction().get("invoice_no");
-                    if (sn != null) supplierName = String.valueOf(sn);
-                    if (inv != null) invoiceNo = String.valueOf(inv);
-                    break;
+
+            if (!children.isEmpty()) {
+                Set<String> suppliers = new LinkedHashSet<>();
+                for (Submission child : children) {
+                    List<Document> cDocs = documentRepository.findBySubmission(child);
+                    for (Document d : cDocs) {
+                        if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
+                            Object sn = d.getRawExtraction().get("supplier_name");
+                            if (sn != null) suppliers.add(String.valueOf(sn));
+                            break;
+                        }
+                    }
+                }
+                if (suppliers.size() == 1) {
+                    supplierName = suppliers.iterator().next();
+                } else if (!suppliers.isEmpty()) {
+                    supplierName = suppliers.iterator().next() + " +" + (suppliers.size() - 1) + " more";
+                }
+                invoiceNo = invoiceCount + " Invoices";
+            } else {
+                List<Document> docs = documentRepository.findBySubmission(s);
+                for (Document d : docs) {
+                    if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
+                        Object sn = d.getRawExtraction().get("supplier_name");
+                        Object inv = d.getRawExtraction().get("invoice_no");
+                        if (sn != null) supplierName = String.valueOf(sn);
+                        if (inv != null) invoiceNo = String.valueOf(inv);
+                        break;
+                    }
                 }
             }
+
             return new SubmissionSummaryDto(
                     s.getId(),
                     s.getBillCategory().getName(),
                     s.getStatus(),
                     s.getUploadedAt(),
                     supplierName,
-                    invoiceNo
+                    invoiceNo,
+                    invoiceCount
             );
         });
     }
@@ -300,12 +328,61 @@ public class SubmissionService {
         Submission s = submissionRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + id));
 
-        List<DocumentDto> docs = documentRepository.findBySubmission(s).stream()
+        Long parentId = s.getParentSubmissionId();
+        List<Submission> siblingsOrChildren;
+        if (parentId != null) {
+            siblingsOrChildren = submissionRepository.findByParentSubmissionIdOrderByIdAsc(parentId);
+        } else {
+            siblingsOrChildren = submissionRepository.findByParentSubmissionIdOrderByIdAsc(id);
+        }
+
+        List<com.pjl.bills.dto.SubmissionInvoiceItemDto> invoicesList = new ArrayList<>();
+        if (!siblingsOrChildren.isEmpty()) {
+            for (Submission item : siblingsOrChildren) {
+                String invNo = null;
+                String suppName = null;
+                BigDecimal totAmt = null;
+                List<Document> cDocs = documentRepository.findBySubmission(item);
+                for (Document d : cDocs) {
+                    if ("invoice".equals(d.getDocType()) && d.getRawExtraction() != null) {
+                        Object inv = d.getRawExtraction().get("invoice_no");
+                        Object sn = d.getRawExtraction().get("supplier_name");
+                        Object tot = d.getRawExtraction().get("total_amount");
+                        if (inv != null) invNo = String.valueOf(inv);
+                        if (sn != null) suppName = String.valueOf(sn);
+                        if (tot instanceof Number num) totAmt = BigDecimal.valueOf(num.doubleValue());
+                        break;
+                    }
+                }
+                int lines = matchedLineItemRepository.findBySubmissionIdOrderByIdAsc(item.getId()).size();
+                int exCount = auditLogRepository.findByEntityTypeAndEntityId("Submission", item.getId()).stream()
+                        .filter(a -> "EXCEPTION".equals(a.getAction()))
+                        .toList().size();
+                invoicesList.add(new com.pjl.bills.dto.SubmissionInvoiceItemDto(
+                        item.getId(),
+                        invNo != null ? invNo : "#" + item.getId(),
+                        suppName,
+                        totAmt,
+                        item.getStatus(),
+                        lines,
+                        exCount
+                ));
+            }
+        }
+
+        Submission displaySub = s;
+        if (parentId == null && !siblingsOrChildren.isEmpty()) {
+            displaySub = siblingsOrChildren.getFirst();
+        }
+
+        Long displayId = displaySub.getId();
+
+        List<DocumentDto> docs = documentRepository.findBySubmission(displaySub).stream()
                 .map(d -> new DocumentDto(d.getId(), d.getDocType(), d.getFileRef(),
                         d.getOriginalFilename(), d.getRawExtraction()))
                 .toList();
 
-        List<AuditLogDto> logs = auditLogRepository.findByEntityTypeAndEntityId("Submission", id).stream()
+        List<AuditLogDto> logs = auditLogRepository.findByEntityTypeAndEntityId("Submission", displayId).stream()
                 .sorted(Comparator.comparing(AuditLog::getCreatedAt))
                 .map(a -> new AuditLogDto(a.getId(), a.getAction(), a.getDetail(), a.getActor(), a.getCreatedAt()))
                 .toList();
@@ -315,7 +392,7 @@ public class SubmissionService {
                 .toList();
 
         List<MatchedLineItemDto> matchedLineItems = matchedLineItemRepository
-                .findBySubmissionIdOrderByIdAsc(id).stream()
+                .findBySubmissionIdOrderByIdAsc(displayId).stream()
                 .map(e -> new MatchedLineItemDto(
                         e.getId(),
                         e.getItemDescription(),
@@ -331,18 +408,20 @@ public class SubmissionService {
                 .toList();
 
         return new SubmissionDetailDto(
-                s.getId(),
+                displayId,
                 s.getBillCategory().getName(),
-                s.getStatus(),
-                s.getUploadedAt(),
-                s.getReviewerNotes(),
-                s.getWarrantyStatus(),
+                displaySub.getStatus(),
+                displaySub.getUploadedAt(),
+                displaySub.getReviewerNotes(),
+                displaySub.getWarrantyStatus(),
                 docs,
                 logs,
                 exceptions,
                 matchedLineItems,
                 s.getPoGrnSource(),
-                s.getPoGrnImportBatchId()
+                s.getPoGrnImportBatchId(),
+                parentId != null ? parentId : s.getId(),
+                invoicesList
         );
     }
 
@@ -413,6 +492,12 @@ public class SubmissionService {
     public void deleteSubmission(Long id) {
         Submission submission = submissionRepository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Submission not found: " + id));
+
+        // Delete children submissions if this is a parent submission
+        List<Submission> children = submissionRepository.findByParentSubmissionIdOrderByIdAsc(id);
+        for (Submission child : children) {
+            deleteSubmission(child.getId());
+        }
 
         // 1. Delete R2 files and DocumentPages
         List<Document> docs = documentRepository.findBySubmission(submission);

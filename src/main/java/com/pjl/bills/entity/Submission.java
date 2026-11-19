@@ -42,4 +42,7 @@ public class Submission extends AuditableEntity {
 
     @Column(name = "po_grn_import_batch_id")
     private Long poGrnImportBatchId;
+
+    @Column(name = "parent_submission_id")
+    private Long parentSubmissionId;
 }

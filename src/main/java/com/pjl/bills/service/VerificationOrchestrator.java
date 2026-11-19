@@ -95,6 +95,37 @@ public class VerificationOrchestrator {
     // Main pipeline (isolated so exceptions can always be caught at the top)
     // ─────────────────────────────────────────────────────────────────────────────
 
+    private record FilePayload(List<byte[]> bytes, List<String> mimeTypes) {
+        public boolean isEmpty() {
+            return bytes == null || bytes.isEmpty();
+        }
+    }
+
+    private FilePayload getFilePayload(Document doc) {
+        List<byte[]> allFileBytes = new ArrayList<>();
+        List<String> allMimeTypes = new ArrayList<>();
+
+        var pages = fileStorage.retrievePages(doc);
+        if (pages != null && !pages.isEmpty()) {
+            for (var page : pages) {
+                if (page.getFileData() != null && page.getFileData().length > 0) {
+                    allFileBytes.add(page.getFileData());
+                    allMimeTypes.add(page.getMimeType() != null
+                            ? page.getMimeType()
+                            : detectMimeType(page.getFileName()));
+                }
+            }
+        }
+        if (allFileBytes.isEmpty()) {
+            byte[] fileBytes = fileStorage.retrieve(doc);
+            if (fileBytes != null && fileBytes.length > 0) {
+                allFileBytes.add(fileBytes);
+                allMimeTypes.add(detectMimeType(doc.getFileRef()));
+            }
+        }
+        return new FilePayload(allFileBytes, allMimeTypes);
+    }
+
     private void runPipeline(Submission submission) {
         try {
             // Step 1: Mark as PROCESSING
@@ -109,25 +140,7 @@ public class VerificationOrchestrator {
                 return;
             }
 
-            // Normal 3-file flow
-            List<Document> documents = documentRepository.findBySubmission(submission);
-            boolean extractionOk = extractAllDocuments(submission, strategy, documents);
-
-            if (!extractionOk) {
-                return;
-            }
-
-            documents = documentRepository.findBySubmission(submission);
-
-            // Step 5: Run verification
-            log.info("[Orchestrator] Running verification for submission id={}", submission.getId());
-            VerifiedSubmissionResult result = strategy.verify(submission, documents);
-
-            // Step 6: Persist result via OutputSink (updates status + audit trail)
-            outputSink.saveVerifiedSubmission(result);
-
-            log.info("[Orchestrator] Pipeline complete for submission id={} — final status={}",
-                    submission.getId(), result.finalStatus());
+            runMultiFilePipeline(submission, strategy);
 
         } catch (Exception e) {
             log.error("[Orchestrator] Unexpected failure for submission id={}",
@@ -136,6 +149,250 @@ public class VerificationOrchestrator {
                     "Unexpected orchestration error: " + e.getClass().getSimpleName()
                     + " — " + e.getMessage());
         }
+    }
+
+    private void runMultiFilePipeline(Submission submission, VerificationStrategy strategy) {
+        List<Document> documents = documentRepository.findBySubmission(submission);
+        Document invoiceDoc = documents.stream().filter(d -> "invoice".equals(d.getDocType())).findFirst().orElse(null);
+        Document grnDoc = documents.stream().filter(d -> "grn".equals(d.getDocType())).findFirst().orElse(null);
+        Document poDoc = documents.stream().filter(d -> "po".equals(d.getDocType())).findFirst().orElse(null);
+
+        if (invoiceDoc == null) {
+            markFailed(submission, "Missing invoice document in submission.");
+            return;
+        }
+
+        FilePayload invPayload = getFilePayload(invoiceDoc);
+        if (invPayload.isEmpty()) {
+            markFailed(submission, "No file bytes found for invoice document.");
+            return;
+        }
+
+        JsonNode root = null;
+        try {
+            root = geminiExtractionService.extractFromMultipleFiles(
+                    invPayload.bytes(), invPayload.mimeTypes(),
+                    com.pjl.bills.spares.SparesExtractionPrompts.BATCH_EXTRACTION_PROMPT);
+        } catch (Exception e) {
+            log.warn("[Orchestrator] Batch invoice extraction failed, falling back to standard extraction: {}", e.getMessage());
+        }
+
+        JsonNode invoicesNode = root != null ? root.get("invoices") : null;
+        if (invoicesNode == null && root != null && root.isArray()) {
+            invoicesNode = root;
+        }
+
+        // If not a multi-invoice PDF, fall back to standard single-document flow
+        if (invoicesNode == null || !invoicesNode.isArray() || invoicesNode.size() <= 1) {
+            boolean extractionOk = extractAllDocuments(submission, strategy, documents);
+            if (!extractionOk) return;
+
+            List<Document> currentDocs = documentRepository.findBySubmission(submission);
+            log.info("[Orchestrator] Running verification for single-invoice submission id={}", submission.getId());
+            VerifiedSubmissionResult result = strategy.verify(submission, currentDocs);
+            outputSink.saveVerifiedSubmission(result);
+            log.info("[Orchestrator] Pipeline complete for submission id={} — final status={}",
+                    submission.getId(), result.finalStatus());
+            return;
+        }
+
+        // MULTI-INVOICE PACKAGE DETECTED
+        int totalInvoices = invoicesNode.size();
+        log.info("[Orchestrator] Detected MULTI-INVOICE package with {} invoices for submission id={}",
+                totalInvoices, submission.getId());
+
+        // Extract GRNs in batch if GRN document exists
+        List<Map<String, Object>> grnList = new ArrayList<>();
+        if (grnDoc != null) {
+            FilePayload grnPayload = getFilePayload(grnDoc);
+            if (!grnPayload.isEmpty()) {
+                try {
+                    JsonNode grnRoot = geminiExtractionService.extractFromMultipleFiles(
+                            grnPayload.bytes(), grnPayload.mimeTypes(),
+                            com.pjl.bills.spares.SparesExtractionPrompts.BATCH_GRN_EXTRACTION_PROMPT);
+                    JsonNode grnsNode = grnRoot != null ? grnRoot.get("grns") : null;
+                    if (grnsNode == null && grnRoot != null && grnRoot.isArray()) grnsNode = grnRoot;
+                    if (grnsNode != null && grnsNode.isArray()) {
+                        for (JsonNode g : grnsNode) {
+                            if (g.isObject()) {
+                                grnList.add(objectMapper.convertValue(g, new TypeReference<Map<String, Object>>() {}));
+                            }
+                        }
+                    }
+                    log.info("[Orchestrator] Extracted {} GRNs for multi-invoice package", grnList.size());
+                } catch (Exception e) {
+                    log.warn("[Orchestrator] Batch GRN extraction failed: {}", e.getMessage());
+                }
+            }
+        }
+
+        // Extract POs in batch if PO document exists
+        List<Map<String, Object>> poList = new ArrayList<>();
+        if (poDoc != null) {
+            FilePayload poPayload = getFilePayload(poDoc);
+            if (!poPayload.isEmpty()) {
+                try {
+                    JsonNode poRoot = geminiExtractionService.extractFromMultipleFiles(
+                            poPayload.bytes(), poPayload.mimeTypes(),
+                            com.pjl.bills.spares.SparesExtractionPrompts.BATCH_PO_EXTRACTION_PROMPT);
+                    JsonNode posNode = poRoot != null ? poRoot.get("pos") : null;
+                    if (posNode == null && poRoot != null && poRoot.isArray()) posNode = poRoot;
+                    if (posNode != null && posNode.isArray()) {
+                        for (JsonNode p : posNode) {
+                            if (p.isObject()) {
+                                poList.add(objectMapper.convertValue(p, new TypeReference<Map<String, Object>>() {}));
+                            }
+                        }
+                    }
+                    log.info("[Orchestrator] Extracted {} POs for multi-invoice package", poList.size());
+                } catch (Exception e) {
+                    log.warn("[Orchestrator] Batch PO extraction failed: {}", e.getMessage());
+                }
+            }
+        }
+
+        List<String> childStatuses = new ArrayList<>();
+
+        for (int i = 0; i < totalInvoices; i++) {
+            try {
+                JsonNode invNode = invoicesNode.get(i);
+                if (invNode.isArray() && !invNode.isEmpty()) {
+                    invNode = invNode.get(0);
+                }
+                Map<String, Object> invMap = objectMapper.convertValue(invNode, new TypeReference<Map<String, Object>>() {});
+                Map<String, Object> matchedGrn = findMatchingGrn(invMap, grnList, i);
+                Map<String, Object> matchedPo = findMatchingPo(invMap, matchedGrn, poList, i);
+
+                Submission child = new Submission();
+                child.setParentSubmissionId(submission.getId());
+                child.setBillCategory(submission.getBillCategory());
+                child.setStatus("PROCESSING");
+                child.setUploadedAt(java.time.Instant.now());
+                child.setPoGrnSource("upload");
+                child = submissionRepository.save(child);
+
+                Document childInvDoc = new Document();
+                childInvDoc.setSubmission(child);
+                childInvDoc.setDocType("invoice");
+                childInvDoc.setFileRef(invoiceDoc.getFileRef());
+                childInvDoc.setOriginalFilename(invoiceDoc.getOriginalFilename());
+                childInvDoc.setRawExtraction(invMap);
+                childInvDoc = documentRepository.save(childInvDoc);
+
+                Document childGrnDoc = new Document();
+                childGrnDoc.setSubmission(child);
+                childGrnDoc.setDocType("grn");
+                childGrnDoc.setFileRef(grnDoc != null ? grnDoc.getFileRef() : null);
+                childGrnDoc.setOriginalFilename(grnDoc != null ? grnDoc.getOriginalFilename() : null);
+                childGrnDoc.setRawExtraction(matchedGrn);
+                childGrnDoc = documentRepository.save(childGrnDoc);
+
+                Document childPoDoc = new Document();
+                childPoDoc.setSubmission(child);
+                childPoDoc.setDocType("po");
+                childPoDoc.setFileRef(poDoc != null ? poDoc.getFileRef() : null);
+                childPoDoc.setOriginalFilename(poDoc != null ? poDoc.getOriginalFilename() : null);
+                childPoDoc.setRawExtraction(matchedPo);
+                childPoDoc = documentRepository.save(childPoDoc);
+
+                List<Document> childDocs = List.of(childInvDoc, childGrnDoc, childPoDoc);
+                VerifiedSubmissionResult childResult = strategy.verify(child, childDocs);
+                outputSink.saveVerifiedSubmission(childResult);
+                childStatuses.add(childResult.finalStatus().name());
+
+                log.info("[Orchestrator] Multi-invoice child submission id={} verified, status={}",
+                        child.getId(), childResult.finalStatus());
+            } catch (Exception ex) {
+                log.error("[Orchestrator] Error processing invoice #{} in package", i + 1, ex);
+                childStatuses.add("RED");
+            }
+        }
+
+        String overallStatus = "GREEN";
+        if (childStatuses.contains("RED")) {
+            overallStatus = "RED";
+        } else if (childStatuses.contains("AMBER")) {
+            overallStatus = "AMBER";
+        } else if (childStatuses.contains("AWAITING_PO_GRN")) {
+            overallStatus = "AWAITING_PO_GRN";
+        }
+        submission.setStatus(overallStatus);
+        submissionRepository.save(submission);
+
+        AuditLog auditLog = new AuditLog();
+        auditLog.setEntityType(ENTITY_TYPE);
+        auditLog.setEntityId(submission.getId());
+        auditLog.setAction("VERIFIED");
+        auditLog.setDetail(String.format("Multi-invoice package verified (%d invoices). Overall status: %s", totalInvoices, overallStatus));
+        auditLog.setActor("system");
+        auditLogRepository.save(auditLog);
+
+        log.info("[Orchestrator] Multi-invoice package complete for parent id={}, overallStatus={}",
+                submission.getId(), overallStatus);
+    }
+
+    private Map<String, Object> findMatchingGrn(Map<String, Object> invMap, List<Map<String, Object>> grnList, int index) {
+        String invNo = cleanString(invMap.get("invoice_no"));
+        String poNo = cleanString(invMap.get("po_number"));
+
+        // 1. Match by supplier_invoice_no
+        if (invNo != null && !invNo.isEmpty()) {
+            for (var grn : grnList) {
+                String gInv = cleanString(grn.get("supplier_invoice_no"));
+                if (gInv != null && (gInv.equalsIgnoreCase(invNo) || gInv.contains(invNo) || invNo.contains(gInv))) {
+                    return grn;
+                }
+            }
+        }
+        // 2. Match by po_number
+        if (poNo != null && !poNo.isEmpty()) {
+            for (var grn : grnList) {
+                String gPo = cleanString(grn.get("po_number"));
+                if (gPo != null && (gPo.equalsIgnoreCase(poNo) || gPo.contains(poNo) || poNo.contains(gPo))) {
+                    return grn;
+                }
+            }
+        }
+        // 3. Fallback to index
+        if (index >= 0 && index < grnList.size()) {
+            return grnList.get(index);
+        }
+        return new HashMap<>();
+    }
+
+    private Map<String, Object> findMatchingPo(Map<String, Object> invMap, Map<String, Object> grnMap, List<Map<String, Object>> poList, int index) {
+        String invPo = cleanString(invMap.get("po_number"));
+        String grnPo = cleanString(grnMap.get("po_number"));
+        String supp = cleanString(invMap.get("supplier_name"));
+
+        for (var po : poList) {
+            String pNo = cleanString(po.get("po_number"));
+            if (pNo != null && !pNo.isEmpty()) {
+                if ((invPo != null && pNo.equalsIgnoreCase(invPo)) || (grnPo != null && pNo.equalsIgnoreCase(grnPo))) {
+                    return po;
+                }
+            }
+        }
+        // Match by supplier name
+        if (supp != null && !supp.isEmpty()) {
+            for (var po : poList) {
+                String pSupp = cleanString(po.get("supplier_name"));
+                if (pSupp != null && (pSupp.toLowerCase().contains(supp.toLowerCase()) || supp.toLowerCase().contains(pSupp.toLowerCase()))) {
+                    return po;
+                }
+            }
+        }
+        // Fallback to index
+        if (index >= 0 && index < poList.size()) {
+            return poList.get(index);
+        }
+        return new HashMap<>();
+    }
+
+    private String cleanString(Object obj) {
+        if (obj == null) return null;
+        String s = String.valueOf(obj).trim();
+        return s.isEmpty() ? null : s;
     }
 
     private void runBatchInvoicePipeline(Submission submission, VerificationStrategy strategy) {
@@ -147,8 +404,8 @@ public class VerificationOrchestrator {
         }
 
         try {
-            byte[] fileBytes = fileStorage.retrieve(invoiceDoc);
-            if (fileBytes == null) {
+            FilePayload invPayload = getFilePayload(invoiceDoc);
+            if (invPayload.isEmpty()) {
                 markFailed(submission, "Invoice file not found in storage.");
                 return;
             }
@@ -156,8 +413,8 @@ public class VerificationOrchestrator {
             log.info("[Orchestrator] Running BATCH extraction for submission id={}", submission.getId());
             String prompt = com.pjl.bills.spares.SparesExtractionPrompts.BATCH_EXTRACTION_PROMPT;
             com.fasterxml.jackson.databind.JsonNode root = geminiExtractionService.extractFromMultipleFiles(
-                    List.of(fileBytes), 
-                    List.of("application/pdf"), 
+                    invPayload.bytes(), 
+                    invPayload.mimeTypes(), 
                     prompt);
 
             if (root == null) {
@@ -177,14 +434,18 @@ public class VerificationOrchestrator {
             com.fasterxml.jackson.databind.node.ArrayNode invoices = (com.fasterxml.jackson.databind.node.ArrayNode) invoicesNode;
             log.info("[Orchestrator] Found {} invoices in submission id={}", invoices.size(), submission.getId());
 
-            // Process the first invoice using the current submission
-            processSingleExtractedInvoice(submission, invoiceDoc, invoices.get(0), strategy);
+            if (invoices.size() == 1) {
+                processSingleExtractedInvoice(submission, invoiceDoc, invoices.get(0), strategy);
+                return;
+            }
 
-            // Spawn new submissions for the remaining invoices
-            for (int i = 1; i < invoices.size(); i++) {
+            // Spawn child submissions for each invoice
+            List<String> childStatuses = new ArrayList<>();
+            for (int i = 0; i < invoices.size(); i++) {
                 try {
                     Submission newSub = new Submission();
                     newSub.setBillCategory(submission.getBillCategory());
+                    newSub.setParentSubmissionId(submission.getId());
                     newSub.setStatus("PROCESSING");
                     newSub.setUploadedAt(java.time.Instant.now());
                     newSub.setPoGrnSource("ramco_import");
@@ -197,12 +458,35 @@ public class VerificationOrchestrator {
                     newDoc.setOriginalFilename(invoiceDoc.getOriginalFilename());
                     newDoc = documentRepository.save(newDoc);
 
-                    log.info("[Orchestrator] Spawned new submission id={} for invoice #{}", newSub.getId(), i + 1);
+                    log.info("[Orchestrator] Spawned child submission id={} for invoice #{}", newSub.getId(), i + 1);
                     processSingleExtractedInvoice(newSub, newDoc, invoices.get(i), strategy);
+
+                    Submission reloaded = submissionRepository.findById(newSub.getId()).orElse(newSub);
+                    childStatuses.add(reloaded.getStatus());
                 } catch (Exception ex) {
                     log.error("[Orchestrator] Failed to spawn and process invoice #{}", i + 1, ex);
+                    childStatuses.add("RED");
                 }
             }
+
+            String overallStatus = "GREEN";
+            if (childStatuses.contains("RED")) {
+                overallStatus = "RED";
+            } else if (childStatuses.contains("AMBER")) {
+                overallStatus = "AMBER";
+            } else if (childStatuses.contains("AWAITING_PO_GRN")) {
+                overallStatus = "AWAITING_PO_GRN";
+            }
+            submission.setStatus(overallStatus);
+            submissionRepository.save(submission);
+
+            AuditLog auditLog = new AuditLog();
+            auditLog.setEntityType(ENTITY_TYPE);
+            auditLog.setEntityId(submission.getId());
+            auditLog.setAction("VERIFIED");
+            auditLog.setDetail(String.format("Batch invoices verified (%d invoices). Overall status: %s", invoices.size(), overallStatus));
+            auditLog.setActor("system");
+            auditLogRepository.save(auditLog);
 
         } catch (Exception e) {
             log.error("[Orchestrator] Unexpected failure during batch extraction for submission id={}", submission.getId(), e);

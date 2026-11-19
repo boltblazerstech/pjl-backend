@@ -15,6 +15,8 @@ public record SubmissionDetailDto(
         List<AuditLogDto> exceptions,
         List<MatchedLineItemDto> matchedLineItems,
         String poGrnSource,
-        Long poGrnImportBatchId
+        Long poGrnImportBatchId,
+        Long parentSubmissionId,
+        List<SubmissionInvoiceItemDto> invoices
 ) {
 }
